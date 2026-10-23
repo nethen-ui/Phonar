@@ -28,8 +28,8 @@ import kotlin.math.sin
 
 // ---------- Tunable settings ----------
 private const val SR = 48000            // sample rate (Hz)
-private const val F_START = 16000.0     // chirp start frequency (Hz)
-private const val F_END = 20000.0       // chirp end frequency (Hz)
+private const val F_START = 1000.0
+private const val F_END = 4000.0     // chirp end frequency (Hz)
 private const val CHIRP_MS = 10         // chirp length (ms)
 private const val LISTEN_MS = 350       // recording window per ping (ms)
 private const val SPEED_OF_SOUND = 343.0
