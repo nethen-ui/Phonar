@@ -20,23 +20,26 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 // ---------- Tunable settings ----------
 private const val SR = 48000            // sample rate (Hz)
-private const val F_START = 1000.0
-private const val F_END = 4000.0     // chirp end frequency (Hz)
+private const val F_START = 2000.0      // chirp start frequency (Hz)  (audible debug band; later 16000.0)
+private const val F_END = 8000.0        // chirp end frequency (Hz)  (later 20000.0)
 private const val CHIRP_MS = 10         // chirp length (ms)
 private const val LISTEN_MS = 350       // recording window per ping (ms)
 private const val SPEED_OF_SOUND = 343.0
 private const val MIN_GAP = 60          // ignore echoes closer than ~0.2 m (samples after direct sound)
 private const val MAX_RANGE_M = 6.0     // farthest echo we look for
 private const val SNR_THRESHOLD = 5f    // echo peak must be this many times above noise floor
+private const val REL_THRESHOLD = 0.3f  // pick the NEAREST peak that is >= this fraction of the biggest peak
 // --------------------------------------
+
+class Echo(val meters: Double?, val strength: Float, val debug: String, val level: Float)
 
 class MainActivity : ComponentActivity() {
 
@@ -119,26 +122,32 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------- Chirp generation ----------
-    private fun makeChirp(): FloatArray {
+    // quadrature = true gives the 90-degree shifted copy, used to build a smooth envelope
+    private fun makeChirp(quadrature: Boolean): FloatArray {
         val n = SR * CHIRP_MS / 1000
         val T = n.toDouble() / SR
         val k = (F_END - F_START) / T
         return FloatArray(n) { i ->
             val t = i.toDouble() / SR
             val phase = 2 * PI * (F_START * t + 0.5 * k * t * t)
-            val window = 0.5 - 0.5 * cos(2 * PI * i / (n - 1)) // Hann window = smooth start/end
-            (sin(phase) * window).toFloat()
+            val window = 0.5 - 0.5 * cos(2 * PI * i / (n - 1)) // Hann window
+            val v = if (quadrature) cos(phase) else sin(phase)
+            (v * window).toFloat()
         }
     }
 
     // ---------- Main loop: ping -> record -> analyse ----------
     @SuppressLint("MissingPermission")
     private fun sonarLoop() {
-        val chirp = makeChirp()
+        val chirp = makeChirp(false)
+        val quad = makeChirp(true)
         val n = chirp.size
+        var en = 0.0
+        for (v in chirp) en += (v * v).toDouble()
+        val energy = en.toFloat()
 
-        // Short PCM version of the chirp (+ a little silence after it)
-        val pcm = ShortArray(n * 2)
+        // Only the chirp itself is played (no padding), one clean ping per cycle
+        val pcm = ShortArray(n)
         for (i in 0 until n) pcm[i] = (chirp[i] * 0.95f * Short.MAX_VALUE).toInt().toShort()
 
         val am = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -185,11 +194,11 @@ class MainActivity : ComponentActivity() {
 
         val recent = ArrayDeque<Double>()
         val buf = ShortArray(m)
-        track.play()
 
         try {
             while (running) {
-                // 1) start recording, 2) fire the chirp, 3) read the whole listening window
+                // Fresh start every ping: play -> record -> stop -> flush (so nothing is ever replayed)
+                track.play()
                 rec.startRecording()
                 track.write(pcm, 0, pcm.size)
                 var got = 0
@@ -199,20 +208,24 @@ class MainActivity : ComponentActivity() {
                     got += r
                 }
                 rec.stop()
+                track.pause()
+                track.flush()
                 if (got < m) break
 
-                val result = analyse(buf, chirp)
+                val result = analyse(buf, chirp, quad, energy)
                 runOnUiThread {
                     if (result == null) {
-                        infoText.text = "No clear echo (try closer/louder, or check the chirp band)"
+                        infoText.text = "Mic hears almost nothing of the chirp. Raise media volume."
+                    } else if (result.meters == null) {
+                        infoText.text = String.format("No clear echo\nown chirp level: %.3f\n%s", result.level, result.debug)
                     } else {
-                        recent.addLast(result.first)
+                        recent.addLast(result.meters)
                         if (recent.size > 5) recent.removeFirst()
                         val median = recent.sorted()[recent.size / 2]
                         distanceText.text = String.format("%.2f m", median)
                         infoText.text = String.format(
-                            "last ping: %.2f m   echo strength: %.1fx noise",
-                            result.first, result.second
+                            "last ping: %.2f m  (%.1fx noise)\nown chirp level: %.3f\n%s",
+                            result.meters, result.strength, result.level, result.debug
                         )
                     }
                 }
@@ -227,12 +240,12 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Cross-correlates the recording with the chirp (matched filter).
-     * The strongest early peak is the direct speaker->mic sound (our time reference),
-     * the next strong peak after it is the wall echo.
-     * Returns Pair(distance in meters, echo strength relative to noise) or null.
+     * Matched filter with an in-phase and a quadrature template, giving a smooth envelope.
+     * Only energy that looks like the chirp (same band and sweep) produces a peak.
+     * The strongest early peak = direct speaker->mic sound (time reference).
+     * The NEAREST strong peak after it = closest reflecting surface.
      */
-    private fun analyse(raw: ShortArray, chirp: FloatArray): Pair<Double, Float>? {
+    private fun analyse(raw: ShortArray, chirp: FloatArray, quad: FloatArray, energy: Float): Echo? {
         val m = raw.size
         val n = chirp.size
         val x = FloatArray(m)
@@ -244,14 +257,19 @@ class MainActivity : ComponentActivity() {
         val len = m - n
         val c = FloatArray(len)
         for (k in 0 until len) {
-            var s = 0f
-            for (i in 0 until n) s += x[k + i] * chirp[i]
-            c[k] = abs(s)
+            var si = 0f
+            var sq = 0f
+            for (i in 0 until n) {
+                val v = x[k + i]
+                si += v * chirp[i]
+                sq += v * quad[i]
+            }
+            c[k] = sqrt(si * si + sq * sq)
         }
 
         var maxV = 0f
         for (v in c) if (v > maxV) maxV = v
-        if (maxV < 0.01f) return null // nothing heard at all
+        if (maxV / energy < 0.002f) return null
 
         // direct path: first sample above half of the global max, refined to the local peak
         var d = 0
@@ -259,24 +277,39 @@ class MainActivity : ComponentActivity() {
         var best = d
         for (k in d until min(d + 40, len)) if (c[k] > c[best]) best = k
         d = best
+        val level = c[d] / energy   // roughly: loudness of our own chirp at the mic (1.0 = full scale)
 
         val maxGap = (2.0 * MAX_RANGE_M / SPEED_OF_SOUND * SR).toInt()
         val lo = d + MIN_GAP
         val hi = d + maxGap
         val tail = 2000
-        if (hi >= len - tail) return null
+        if (hi >= len - tail) return Echo(null, 0f, "direct@$d too late in window", level)
 
         var noise = 0f
         for (k in len - tail until len) noise += c[k]
         noise /= tail
         if (noise <= 0f) return null
+        val thr = SNR_THRESHOLD * noise
 
-        var e = lo
-        for (k in lo..hi) if (c[k] > c[e]) e = k
-        val strength = c[e] / noise
-        if (strength < SNR_THRESHOLD) return null
+        // local maxima (+-20 samples) above the threshold
+        val cands = ArrayList<Pair<Int, Float>>()
+        for (k in lo..hi) {
+            if (c[k] <= thr) continue
+            var isPeak = true
+            for (j in max(0, k - 20)..min(len - 1, k + 20)) {
+                if (c[j] > c[k]) { isPeak = false; break }
+            }
+            if (isPeak) cands.add(Pair(k, c[k]))
+        }
 
-        val seconds = (e - d).toDouble() / SR
-        return Pair(seconds * SPEED_OF_SOUND / 2.0, strength)
+        fun meters(k: Int) = (k - d).toDouble() / SR * SPEED_OF_SOUND / 2.0
+        val dbg = "peaks: " + cands.sortedByDescending { it.second }.take(4)
+            .joinToString("   ") { String.format("%.2fm(%.0fx)", meters(it.first), it.second / noise) }
+
+        if (cands.isEmpty()) return Echo(null, 0f, "no peaks above ${SNR_THRESHOLD}x noise", level)
+
+        val biggest = cands.maxOf { it.second }
+        val chosen = cands.first { it.second >= REL_THRESHOLD * biggest } // list is in position order
+        return Echo(meters(chosen.first), chosen.second / noise, dbg, level)
     }
 }
